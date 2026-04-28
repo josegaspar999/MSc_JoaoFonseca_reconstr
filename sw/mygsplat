@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+mygsplat.py — interactive pipeline: video → COLMAP → train → view
+Just run:  python mygsplat.py
+"""
+
+import glob, os, subprocess, sys
+
+# default to the repository root (script lives in gsplat/examples).
+# Previously we appended another "examples" directory, which meant the
+# default path became gsplat/examples/examples and broke when the user
+# didn’t override GSPLAT_DIR.  Use parent directory instead.
+GSPLAT_DIR  = os.environ.get(
+    "GSPLAT_DIR",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+)
+DATA_ROOT   = "data"
+RESULT_ROOT = "results"
+
+# ── colours ───────────────────────────────────────────────────────────────────
+G = "\033[32m"   # green
+Y = "\033[33m"   # yellow
+C = "\033[36m"   # cyan
+B = "\033[1m"    # bold
+R = "\033[0m"    # reset
+E = "\033[31m"   # red
+
+
+def ask(prompt: str, default: str = "", hint: str = "") -> str:
+    """Print a prompt with an optional hint line and a default value. Enter = default."""
+    if hint:
+        print(f"  {C}ℹ  {hint}{R}")
+    value = input(f"  {B}{prompt}{R} [{Y}{default}{R}]: ").strip()
+    return value if value else default
+
+
+def ask_bool(prompt: str, default: bool = False, hint: str = "") -> bool:
+    default_str = "y" if default else "n"
+    raw = ask(prompt + " (y/n)", default=default_str, hint=hint)
+    return raw.lower().startswith("y")
+
+
+def run(cmd: list[str]):
+    print(f"\n  {G}▶ {' '.join(cmd)}{R}\n")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"\n  {E}❌ Command failed.{R}")
+        sys.exit(result.returncode)
+
+
+def resize_images_for_factor(input_root: str, factor: int):
+    """Create input/images_<factor> and resize jpg/jpeg from input/images into it."""
+    if factor <= 1:
+        return
+
+    root = os.path.abspath(input_root)
+    source_dir = os.path.join(root, "images")
+    if not os.path.isdir(source_dir):
+        source_dir = root
+
+    output_dir = os.path.join(root, f"images_{factor}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_files = []
+    for pattern in ("*.jpg", "*.jpeg", "*.JPG", "*.JPEG"):
+        image_files.extend(glob.glob(os.path.join(source_dir, pattern)))
+
+    if not image_files:
+        print(f"\n  {Y}⚠ No JPG/JPEG files found in {source_dir}; skipping resize.{R}")
+        return
+
+    resize_percent = f"{100.0 / factor}%"
+    run(["mogrify", "-path", output_dir, "-resize", resize_percent, *image_files])
+    print(f"\n  {G}✅ Resized images_{factor} ready in {output_dir}{R}")
+
+
+def scene_paths(scene: str):
+    return (
+        os.path.join(DATA_ROOT, scene, "images"),
+        os.path.join(DATA_ROOT, scene, "sparse", "0"),
+        os.path.join(RESULT_ROOT, scene),
+    )
+
+
+def latest_ckpt(result_dir: str) -> str:
+    ckpts = sorted(glob.glob(os.path.join(result_dir, "ckpts", "*.pt")))
+    if not ckpts:
+        print(f"\n  {E}❌ No .pt checkpoint found in {result_dir}/ckpts/{R}")
+        sys.exit(1)
+    return ckpts[-1]
+
+
+def section(title: str):
+    print(f"\n{B}{C}{'─'*60}{R}")
+    print(f"{B}{C}  {title}{R}")
+    print(f"{B}{C}{'─'*60}{R}\n")
+
+
+# ── steps ─────────────────────────────────────────────────────────────────────
+
+def step_extract(scene: str):
+    section("STEP 1 — EXTRACT FRAMES")
+    print(f"  ffmpeg will pull frames from your video into {DATA_ROOT}/{scene}/images/\n")
+
+    inp = ask("Video file or image folder path", hint="e.g. myvideo.mp4  or  /path/to/frames/")
+    if not inp or not os.path.exists(inp):
+        print(f"  {E}❌ Path not found: {inp}{R}")
+        sys.exit(1)
+
+    images_dir, _, _ = scene_paths(scene)
+    os.makedirs(images_dir, exist_ok=True)
+
+    is_video = inp.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
+
+    if is_video:
+        fps = ask("Frames per second to extract", default="2",
+                  hint="2 fps is enough for slow walkthrough videos, use 5-10 for fast motion")
+        print(f"\n  {G}Extracting frames…{R}")
+        run(["ffmpeg", "-i", inp,
+             "-qscale:v", "1", "-qmin", "1",
+             "-vf", f"fps={fps}",
+             f"{images_dir}/frame_%06d.jpg"])
+        resize_root = os.path.join(DATA_ROOT, scene)
+    else:
+        resize_root = os.path.abspath(inp)
+        if os.path.abspath(inp) != os.path.abspath(images_dir):
+            os.rmdir(images_dir)
+            os.symlink(os.path.abspath(inp), os.path.abspath(images_dir))
+
+    count = len(glob.glob(os.path.join(images_dir, "*")))
+    print(f"\n  {G}✅ {count} frames ready in {images_dir}{R}")
+
+    print(f"\n  {G}Creating images_2 and resizing from input images…{R}")
+    resize_images_for_factor(resize_root, 2)
+
+
+def step_colmap(scene: str):
+    section("STEP 2 — COLMAP RECONSTRUCTION")
+    print("  COLMAP will detect keypoints, match them across frames, and\n"
+          "  reconstruct camera poses + a sparse 3D point cloud.\n")
+
+    sequential = ask_bool(
+        "Use sequential matching?", default=True,
+        hint="sequential = fast, for ordered video frames\n"
+             "  ℹ  exhaustive = slow, for unordered photo collections")
+
+    images_dir, _, _ = scene_paths(scene)
+    db          = os.path.join(DATA_ROOT, scene, "database.db")
+    sparse_base = os.path.join(DATA_ROOT, scene, "sparse")
+    os.makedirs(sparse_base, exist_ok=True)
+
+    run(["colmap", "feature_extractor",
+         "--database_path", db,
+         "--image_path",    images_dir,
+         "--ImageReader.single_camera", "1"])
+
+    if sequential:
+        run(["colmap", "sequential_matcher", "--database_path", db])
+    else:
+        run(["colmap", "exhaustive_matcher", "--database_path", db])
+
+    run(["colmap", "mapper",
+         "--database_path", db,
+         "--image_path",    images_dir,
+         "--output_path",   sparse_base])
+
+    ok = os.path.exists(os.path.join(sparse_base, "0"))
+    print(f"\n  {G if ok else E}{'✅ COLMAP done → ' + sparse_base + '/0' if ok else '⚠️  Check COLMAP output manually'}{R}")
+
+
+def step_train(scene: str):
+    section("STEP 3 — TRAIN")
+    data_dir   = os.path.join(DATA_ROOT, scene)
+    _, _, result_dir = scene_paths(scene)
+
+    trainer = os.path.join(GSPLAT_DIR, "examples", "simple_trainer.py")
+    if not os.path.exists(trainer):
+        print(f"  {E}❌ simple_trainer.py not found at {trainer}\n"
+              f"     GSPLAT_DIR should point to the top‑level gsplat directory, not the examples subfolder.{R}")
+        sys.exit(1)
+
+    gut = ask_bool(
+        "Enable 3DGUT?", default=False,
+        hint="3DGUT gives sharper results but takes longer (uses mcmc strategy)\n"
+             "  ℹ  default = standard 3DGS, faster, good quality")
+
+    factor = ask("Image downscale factor", default="2",
+                 hint="1=full res (slow), 2=half (recommended), 4=quarter (low VRAM)")
+
+    if factor in {"4", "8"}:
+        print(f"\n  {G}Creating images_{factor} from {data_dir}/images…{R}")
+        resize_images_for_factor(data_dir, int(factor))
+
+    steps = ask("Training steps", default="30000",
+                hint="30000 = full quality, 7000 = quick test")
+
+    save_ply = ask_bool("Export .ply at end?", default=False,
+                        hint="useful if you want to open the result in SuperSplat or other viewers")
+
+    disable_viewer = ask_bool("Disable live viewer during training?", default=False,
+                              hint="disabling is faster on headless servers with no browser access")
+
+    camera_model = "pinhole"
+    if gut:
+        camera_model = ask("Camera model", default="pinhole",
+                           hint="pinhole = standard lens, fisheye = wide-angle/drone cameras")
+
+    strategy = "mcmc" if gut else "default"
+    cmd = [sys.executable, trainer, strategy,
+           "--data_dir",    data_dir,
+           "--result_dir",  result_dir,
+           "--data_factor", factor,
+           "--max_steps",   steps]
+
+    if gut:
+        cmd += ["--with_ut", "--with_eval3d", "--camera_model", camera_model]
+    if save_ply:
+        cmd += ["--save_ply"]
+    if disable_viewer:
+        cmd += ["--disable_viewer"]
+
+    print()
+    run(cmd)
+    print(f"\n  {G}✅ Training done → {result_dir}{R}")
+
+
+def step_view(scene: str):
+    section("STEP 4 — VIEW")
+    _, _, result_dir = scene_paths(scene)
+
+    gut = ask_bool(
+        "View a 3DGUT checkpoint?", default=False,
+        hint="use simple_viewer_3dgut.py for --gut trained models\n"
+             "  ℹ  use simple_viewer.py for standard training")
+
+    ckpt_default = latest_ckpt(result_dir) if os.path.isdir(result_dir) else ""
+    ckpt = ask("Checkpoint path", default=ckpt_default,
+               hint="leave blank to use the latest checkpoint found automatically")
+
+    viewer_name = "simple_viewer_3dgut.py" if gut else "simple_viewer.py"
+    # viewer scripts are located inside the examples directory
+    viewer = os.path.join(GSPLAT_DIR, "examples", viewer_name)
+    if not os.path.exists(viewer):
+        print(f"  {E}❌ {viewer_name} not found at {viewer}{R}")
+        sys.exit(1)
+
+    print(f"\n  {G}✅ Opening viewer — go to http://localhost:8080{R}\n")
+    run([sys.executable, viewer, "--ckpt", ckpt])
+
+
+# ── main interactive loop ─────────────────────────────────────────────────────
+
+STEPS = {
+    "1": ("Extract frames",        step_extract),
+    "2": ("COLMAP reconstruction", step_colmap),
+    "3": ("Train",                 step_train),
+    "4": ("View",                  step_view),
+}
+
+def main():
+    print(f"\n{B}{C}  ╔══════════════════════════════╗")
+    print(f"  ║       mygsplat pipeline      ║")
+    print(f"  ╚══════════════════════════════╝{R}\n")
+
+    scene = ask("Scene name", default="my_scene",
+                hint="used as folder name under data/ and results/")
+
+    print(f"\n  {B}Which steps do you want to run?{R}\n")
+    for k, (label, _) in STEPS.items():
+        print(f"    {Y}{k}{R}  {label}")
+    print(f"    {Y}a{R}  All steps (full pipeline)\n")
+
+    choice = ask("Steps to run", default="a",
+                 hint="enter a single step (1/2/3/4) or 'a' for all")
+
+    if choice == "a":
+        selected = list(STEPS.keys())
+    else:
+        selected = [c.strip() for c in choice if c.strip() in STEPS]
+        if not selected:
+            print(f"  {E}❌ Invalid choice: {choice}{R}")
+            sys.exit(1)
+
+    print(f"\n  {G}Running steps: {', '.join(STEPS[s][0] for s in selected)}{R}")
+
+    for s in selected:
+        _, fn = STEPS[s]
+        fn(scene)
+
+    print(f"\n{B}{G}  ✅ All done!{R}\n")
+
+
+if __name__ == "__main__":
+    main()
